@@ -7,21 +7,55 @@ import streamlit as st
 # st.iframe is the new API (components.v1.html deprecated)
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
+
+
+def get_setting(name: str, default: str = "") -> str:
+    value = os.getenv(name)
+    if value:
+        return value
+    if st.secrets.load_if_toml_exists():
+        return str(st.secrets.get(name, default))
+    return default
+
 
 # ==============================================================
 # 0. LLM LAYER — Quota-aware multi-model fallback
 # ==============================================================
-_gk = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+_gk = get_setting("GOOGLE_API_KEY") or get_setting("GEMINI_API_KEY")
 
 def invoke_llm(messages: list) -> str:
-    """Try a short Gemini fallback chain, then configured alternate providers."""
+    """Try configured providers in order, preferring OpenAI when a key is present."""
+    failures = []
+
+    # Prefer OpenAI when configured so an exhausted Gemini quota does not block chat.
+    ok = get_setting("OPENAI_API_KEY").strip()
+    if ok:
+        try:
+            from langchain_openai import ChatOpenAI
+
+            raw = (
+                ChatOpenAI(
+                    model="gpt-4o",
+                    temperature=0.0,
+                    timeout=15,
+                    max_retries=0,
+                )
+                .invoke(messages)
+                .content
+            )
+            if isinstance(raw, list):
+                raw = "".join(
+                    p.get("text", "") if isinstance(p, dict) else str(p)
+                    for p in raw
+                )
+            return str(raw).strip()
+        except Exception as e:
+            failures.append(f"OpenAI ({type(e).__name__})")
+
     if _gk:
         try:
             from langchain_google_genai import ChatGoogleGenerativeAI
-        except ImportError:
-            pass
-        else:
             for model in ["gemini-3.5-flash", "gemini-3.1-flash-lite"]:
                 try:
                     raw = (
@@ -42,22 +76,12 @@ def invoke_llm(messages: list) -> str:
                         )
                     return str(raw).strip()
                 except Exception as e:
-                    err = str(e)
-                    if any(
-                        k in err
-                        for k in [
-                            "RESOURCE_EXHAUSTED",
-                            "429",
-                            "NOT_FOUND",
-                            "quota",
-                            "QUOTA",
-                        ]
-                    ):
-                        continue
-                    break  # Non-quota Gemini error — skip to next provider
+                    failures.append(f"Gemini {model} ({type(e).__name__})")
+        except ImportError:
+            failures.append("Gemini (package unavailable)")
 
     # Anthropic fallback
-    ak = os.getenv("ANTHROPIC_API_KEY", "")
+    ak = get_setting("ANTHROPIC_API_KEY")
     if ak.startswith("sk-ant"):
         try:
             from langchain_anthropic import ChatAnthropic
@@ -72,27 +96,12 @@ def invoke_llm(messages: list) -> str:
                 )
                 .strip()
             )
-        except Exception:
-            pass
+        except Exception as e:
+            failures.append(f"Anthropic ({type(e).__name__})")
 
-    # OpenAI fallback
-    ok = os.getenv("OPENAI_API_KEY", "")
-    if ok:
-        try:
-            from langchain_openai import ChatOpenAI
-
-            return (
-                str(
-                    ChatOpenAI(model="gpt-4o", temperature=0.0)
-                    .invoke(messages)
-                    .content
-                )
-                .strip()
-            )
-        except Exception:
-            pass
-
-    raise ValueError("QUOTA_EXCEEDED")
+    if failures:
+        raise ValueError("AI_PROVIDER_UNAVAILABLE: " + "; ".join(failures))
+    raise ValueError("AI_PROVIDER_UNAVAILABLE: no API key is configured")
 
 
 # ==============================================================
@@ -279,14 +288,14 @@ Output STRICT JSON ONLY:
     try:
         raw = invoke_llm(messages)
     except ValueError as e:
-        if "QUOTA_EXCEEDED" in str(e):
+        if "AI_PROVIDER_UNAVAILABLE" in str(e):
             return {
                 "decomposed_intents": ["service_unavailable"],
                 "identified_order_id": None,
                 "selected_move": "ESCALATE",
-                "scratchpad": "AI service quota exceeded across all configured models.",
-                "customer_response": "I apologize — I'm currently experiencing high demand and my AI processing is temporarily at capacity. Please try again in a few minutes, or click **'Speak to Agent'** below to connect with our human support team right away.",
-                "error": "quota",
+                "scratchpad": str(e),
+                "customer_response": "I couldn't connect to the AI service. Please check the API key, account billing, and usage limits, then try again.",
+                "error": "provider_unavailable",
             }
         raise
 
@@ -1244,6 +1253,8 @@ if "messages" not in st.session_state:
 if "pending_chip" not in st.session_state:
     st.session_state.pending_chip = None
 
+login_username = get_setting("APP_USERNAME")
+login_password = get_setting("APP_PASSWORD")
 
 # ==============================================================
 # 9. LOGIN PAGE
@@ -1274,17 +1285,18 @@ if not st.session_state.logged_in:
             username = st.text_input("Username", placeholder="Enter username")
             password = st.text_input("Password", type="password", placeholder="Enter password")
             submit = st.form_submit_button("Sign In →", use_container_width=True)
-            if submit:
-                if username == "admin" and password == "admin123":
+            if submit and login_username and login_password:
+                if username == login_username and password == login_password:
                     st.session_state.logged_in = True
                     st.session_state.messages = []
                     st.rerun()
                 else:
-                    st.error("❌ Invalid credentials — try **admin** / **admin123**")
-        st.markdown(
-            "<div style='text-align:center;margin-top:14px;font-size:12px;color:#475569;'>Demo credentials: admin / admin123</div>",
-            unsafe_allow_html=True,
-        )
+                    st.error("Invalid username or password.")
+        if not login_username or not login_password:
+            st.error(
+                "Login is not configured. Set APP_USERNAME and APP_PASSWORD in "
+                "your local .env file or Streamlit Community Cloud secrets."
+            )
 
 # ==============================================================
 # 10. MAIN APPLICATION
@@ -1474,11 +1486,10 @@ else:
                 reply = trace.get("customer_response", "I'm having trouble responding right now.")
                 ts2 = now_str()
 
-                if trace.get("error") == "quota":
+                if trace.get("error") == "provider_unavailable":
                     st.markdown("""
                     <div class="quota-banner">
-                        ⚠️ <span><strong>AI Capacity Notice:</strong> The AI engine has reached its free-tier limit for now.
-                        Responses below are from fallback logic. Add an OpenAI or Anthropic key in .env for uninterrupted service.</span>
+                        ⚠️ <span><strong>AI Service Unavailable:</strong> Check that your API key is valid and that billing and usage limits are enabled for its provider.</span>
                     </div>
                     """, unsafe_allow_html=True)
 
